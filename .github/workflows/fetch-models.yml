@@ -1,0 +1,230 @@
+name: fetch-models
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: models-v1-release
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: models-v1
+    steps:
+      - name: Check repository access and protect existing release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO" --jq '{full_name, permissions}'
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[].tag_name' > existing-tags.txt
+          if grep -Fxq "$RELEASE_TAG" existing-tags.txt; then
+            echo "::error::Release $RELEASE_TAG already exists; refusing to overwrite it."
+            exit 1
+          fi
+
+      - name: Download and verify upstream assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import struct
+          import subprocess
+          import urllib.parse
+          import zipfile
+
+          out = Path('dist')
+          out.mkdir()
+          model_dir = Path('staging/bge-small-zh-v1.5')
+          sources = {}
+
+          def api_json(url):
+              raw = subprocess.check_output([
+                  'curl', '--fail', '--silent', '--show-error', '--location',
+                  '--retry', '5', '--retry-all-errors', '--connect-timeout', '30',
+                  '--max-time', '120', url,
+              ])
+              return json.loads(raw)
+
+          def sha256(path):
+              with path.open('rb') as f:
+                  return hashlib.file_digest(f, 'sha256').hexdigest()
+
+          def download(url, path, size=None, digest=None, blob=None):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              subprocess.run([
+                  'curl', '--fail', '--silent', '--show-error', '--location',
+                  '--retry', '5', '--retry-all-errors', '--connect-timeout', '30',
+                  '--max-time', '1800', '--output', str(path), url,
+              ], check=True)
+              actual_size = path.stat().st_size
+              if not actual_size or (size is not None and actual_size != size):
+                  raise RuntimeError(f'Invalid size for {path}: {actual_size} != {size}')
+              actual_hash = sha256(path)
+              if digest and actual_hash != digest:
+                  raise RuntimeError(f'SHA256 mismatch: {path}')
+              if blob:
+                  git_hash = hashlib.sha1(f'blob {actual_size}\0'.encode() + path.read_bytes()).hexdigest()
+                  if git_hash != blob:
+                      raise RuntimeError(f'Git blob hash mismatch: {path}')
+              print(f'Verified {path}: {actual_size} bytes, sha256={actual_hash}', flush=True)
+              return {'file': str(path), 'bytes': actual_size, 'sha256': actual_hash}
+
+          def hf_download(repo, revision, entry, path):
+              name = entry['rfilename']
+              lfs = entry.get('lfs') or {}
+              url = f'https://huggingface.co/{repo}/resolve/{revision}/' + urllib.parse.quote(name, safe='/')
+              return download(url, path, entry.get('size'), lfs.get('sha256'),
+                              None if lfs else entry.get('blobId'))
+
+          qwen_repo = 'unsloth/Qwen3.5-2B-GGUF'
+          qwen_name = 'Qwen3.5-2B-Q4_K_M.gguf'
+          qwen = api_json(f'https://huggingface.co/api/models/{qwen_repo}?blobs=true')
+          entry = next((x for x in qwen['siblings'] if x['rfilename'] == qwen_name), None)
+          if not entry or not (entry.get('lfs') or {}).get('sha256'):
+              raise RuntimeError('Expected Qwen file or upstream SHA256 missing')
+          qwen_record = hf_download(qwen_repo, qwen['sha'], entry, out / qwen_name)
+          with (out / qwen_name).open('rb') as f:
+              if f.read(4) != b'GGUF':
+                  raise RuntimeError('Invalid GGUF header')
+          sources['qwen'] = {'repo': qwen_repo, 'revision': qwen['sha'], **qwen_record}
+
+          bge_repo = 'BAAI/bge-small-zh-v1.5'
+          bge = api_json(f'https://huggingface.co/api/models/{bge_repo}?blobs=true')
+          entries = [x for x in bge['siblings'] if PurePosixPath(x['rfilename']).name != 'pytorch_model.bin']
+          required = {
+              'model.safetensors', 'config.json', 'tokenizer.json', 'tokenizer_config.json',
+              'special_tokens_map.json', 'vocab.txt', 'modules.json', '1_Pooling/config.json',
+              'sentence_bert_config.json', 'config_sentence_transformers.json',
+          }
+          names = {x['rfilename'] for x in entries}
+          if missing := required - names:
+              raise RuntimeError(f'BGE upstream missing required files: {sorted(missing)}')
+          records = []
+          for item in sorted(entries, key=lambda x: x['rfilename']):
+              relative = PurePosixPath(item['rfilename'])
+              if relative.is_absolute() or '..' in relative.parts:
+                  raise RuntimeError('Unsafe upstream path')
+              records.append(hf_download(bge_repo, bge['sha'], item, model_dir / str(relative)))
+          actual = {p.relative_to(model_dir).as_posix() for p in model_dir.rglob('*') if p.is_file()}
+          if actual != names or any(p.name == 'pytorch_model.bin' for p in model_dir.rglob('*')):
+              raise RuntimeError('BGE snapshot incomplete or contains excluded weights')
+          for p in model_dir.rglob('*.json'):
+              json.loads(p.read_text(encoding='utf-8'))
+          modules = json.loads((model_dir / 'modules.json').read_text())
+          for module in modules:
+              if module.get('path') and not (model_dir / module['path'] / 'config.json').is_file():
+                  raise RuntimeError(f'Missing module config: {module}')
+          weights = model_dir / 'model.safetensors'
+          with weights.open('rb') as f:
+              header_size = struct.unpack('<Q', f.read(8))[0]
+              if not 0 < header_size < min(weights.stat().st_size - 8, 100_000_000):
+                  raise RuntimeError('Invalid safetensors header size')
+              header = json.loads(f.read(header_size))
+          data_size = weights.stat().st_size - 8 - header_size
+          tensors = [v for k, v in header.items() if k != '__metadata__']
+          if not tensors or any(not 0 <= v['data_offsets'][0] <= v['data_offsets'][1] <= data_size for v in tensors):
+              raise RuntimeError('Invalid safetensors tensor offsets')
+          bge_zip = out / 'bge-small-zh-v1.5.zip'
+          with zipfile.ZipFile(bge_zip, 'w', zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(model_dir.rglob('*')):
+                  if p.is_file():
+                      z.write(p, p.relative_to(model_dir.parent).as_posix())
+          with zipfile.ZipFile(bge_zip) as z:
+              if z.testzip() is not None or set(z.namelist()) != {'bge-small-zh-v1.5/' + n for n in names}:
+                  raise RuntimeError('BGE ZIP validation failed')
+          sources['bge'] = {'repo': bge_repo, 'revision': bge['sha'], 'excluded': ['pytorch_model.bin'], 'files': records}
+
+          # Binary builds are currently prereleases; /releases/latest may contain only nightly-tag.txt.
+          releases = json.loads(subprocess.check_output([
+              'gh', 'api', 'repos/ggml-org/llama.cpp/releases?per_page=100',
+          ]))
+          candidates = [
+              (release, asset)
+              for release in releases if not release['draft']
+              for asset in release['assets']
+              if re.fullmatch(r'llama-.+-bin-win-cpu-x64\.zip', asset['name']) and asset['state'] == 'uploaded'
+          ]
+          if not candidates:
+              raise RuntimeError('No Windows CPU x64 ZIP found in the latest 100 llama.cpp releases')
+          release, asset = max(candidates, key=lambda pair: pair[0]['published_at'])
+          digest = asset.get('digest') or ''
+          llama_record = download(asset['browser_download_url'], out / asset['name'], asset['size'],
+                                  digest.removeprefix('sha256:') if digest.startswith('sha256:') else None)
+          with zipfile.ZipFile(out / asset['name']) as z:
+              if z.testzip() is not None:
+                  raise RuntimeError('llama.cpp ZIP CRC check failed')
+              executables = {PurePosixPath(n).name for n in z.namelist()}
+              if not {'llama-cli.exe', 'llama-server.exe'} <= executables:
+                  raise RuntimeError('llama.cpp ZIP missing required executables')
+          sources['llama_cpp'] = {'tag': release['tag_name'], 'url': release['html_url'],
+                                 'upstream_digest': digest, **llama_record}
+          (out / 'SOURCES.json').write_text(json.dumps(sources, indent=2) + '\n', encoding='utf-8')
+          assets = sorted(out.iterdir())
+          if any(p.stat().st_size >= 2 * 1024**3 for p in assets):
+              raise RuntimeError('An asset exceeds GitHub Release individual asset size limit')
+          (out / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.name}\n' for p in assets), encoding='utf-8')
+          notes = (
+              '# Model assets v1\n\n'
+              f'- Qwen: `{qwen_repo}` revision `{qwen["sha"]}`, `{qwen_name}`.\n'
+              f'- BGE: complete `{bge_repo}` revision `{bge["sha"]}`, excluding `pytorch_model.bin`. '
+              'Includes safetensors, tokenizer, config, pooling, and model card.\n'
+              f'- llama.cpp: latest available Windows CPU **x64** binary ZIP, [{release["tag_name"]}]({release["html_url"]}).\n'
+              '- `SOURCES.json` records upstream versions, sizes, and file checksums.\n'
+              '- Verify downloaded assets with `sha256sum -c SHA256SUMS`.\n\n'
+              'BGE ZIP contents, JSON configs, safetensors offsets, GGUF header, upstream hashes, '
+              'and llama.cpp ZIP/executable presence were checked before publication.\n'
+              'Upstream licenses apply: Qwen Apache-2.0; BGE MIT; llama.cpp MIT.\n'
+          )
+          Path('release-notes.md').write_text(notes, encoding='utf-8')
+          PY
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Upload draft and verify every release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/* --draft --target "$GITHUB_SHA" \
+            --title "Model assets v1" --notes-file release-notes.md
+          gh release view "$RELEASE_TAG" --json assets > uploaded-assets.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          actual = json.loads(Path('uploaded-assets.json').read_text())['assets']
+          expected = {p.name: p.stat().st_size for p in Path('dist').iterdir()}
+          if len(actual) != len(expected) or {a['name']: a['size'] for a in actual} != expected:
+              raise RuntimeError('Uploaded asset names or sizes do not match')
+          if any(a['state'] != 'uploaded' for a in actual):
+              raise RuntimeError('An asset is not fully uploaded')
+          print('All release assets uploaded and sizes verified.')
+          PY
+
+      - name: Publish models-v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false
+          gh release view "$RELEASE_TAG" --json url,isDraft,assets
+          {
+            echo '## Published models-v1'
+            gh release view "$RELEASE_TAG" --json url --jq .url
+            echo
+            cat release-notes.md
+            echo
+            echo '```text'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
