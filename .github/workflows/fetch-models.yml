@@ -126,6 +126,9 @@ jobs:
               json.loads(p.read_text(encoding='utf-8'))
           modules = json.loads((model_dir / 'modules.json').read_text())
           for module in modules:
+              # Normalize is stateless: upstream intentionally stores no directory/config.
+              if module['type'] == 'sentence_transformers.models.Normalize':
+                  continue
               if module.get('path') and not (model_dir / module['path'] / 'config.json').is_file():
                   raise RuntimeError(f'Missing module config: {module}')
           weights = model_dir / 'model.safetensors'
