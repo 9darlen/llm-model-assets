@@ -1,0 +1,86 @@
+name: Build and publish Windows RAG models-v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'release-v2/**'
+      - '.github/workflows/release-rag-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: models-v2-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - name: Protect existing release
+        run: |
+          $tags = gh api --paginate "repos/$env:GH_REPO/releases?per_page=100" --jq '.[].tag_name'
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect releases' }
+          if ($tags -contains 'models-v2') { throw 'models-v2 already exists; refusing to overwrite' }
+      - name: Install pinned application dependencies
+        run: |
+          python -m pip install -r release-v2/app/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed' }
+      - name: Verify model assets and prepare offline wheels
+        run: python release-v2/build/release.py prepare
+      - name: Recreate environment from offline wheels
+        run: |
+          python -m venv verify-env
+          if ($LASTEXITCODE -ne 0) { throw 'venv failed' }
+          .\verify-env\Scripts\python.exe -m pip install --no-index --find-links release-v2/offline/wheelhouse -r release-v2/staging/rag-app/requirements-lock.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Offline install failed' }
+          .\verify-env\Scripts\python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Offline dependency check failed' }
+      - name: Test BGE, Chroma, llama.cpp and Streamlit
+        run: .\verify-env\Scripts\python.exe release-v2/build/smoke.py
+      - name: Package verified assets
+        run: python release-v2/build/release.py package
+      - name: Upload draft and verify assets
+        run: |
+          $assets = @(Get-ChildItem release-v2/dist -File | ForEach-Object { $_.FullName })
+          gh release create models-v2 @assets --draft --target $env:GITHUB_SHA --title 'Windows RAG deployment - models-v2' --notes-file release-v2/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Draft upload failed' }
+          $release = gh release view models-v2 --json assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.assets.Count -ne $assets.Count) { throw 'Asset count mismatch' }
+          foreach ($file in Get-ChildItem release-v2/dist -File) {
+            $asset = @($release.assets | Where-Object name -eq $file.Name)
+            if ($asset.Count -ne 1 -or $asset[0].size -ne $file.Length -or $asset[0].state -ne 'uploaded') { throw "Asset mismatch: $($file.Name)" }
+          }
+      - name: Publish validated models-v2
+        run: |
+          gh release edit models-v2 --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
+          gh release view models-v2 --json url,isDraft,assets
+      - name: Preserve build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: models-v2-diagnostics
+          path: |
+            release-v2/llama-smoke.log
+            release-v2/VALIDATION.json
+          if-no-files-found: ignore
